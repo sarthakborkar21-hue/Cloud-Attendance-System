@@ -1,0 +1,203 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function userData() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function hasRole(role) {
+      return signedIn()
+        && exists(userPath(request.auth.uid))
+        && userData().role == role;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function isTeacher() {
+      return hasRole('teacher');
+    }
+
+    function isStudent() {
+      return hasRole('student');
+    }
+
+    function teacherPath() {
+      return /databases/$(database)/documents/teachers/$(userData().teacherId);
+    }
+
+    function teacherData() {
+      return get(teacherPath()).data;
+    }
+
+    function assignedClass(classId) {
+      return isTeacher()
+        && userData().get('teacherId', '') != ''
+        && exists(teacherPath())
+        && classId in teacherData().get('assignedClasses', []);
+    }
+
+    function linkedStudentExists() {
+      return isStudent()
+        && userData().get('studentId', '') != ''
+        && exists(/databases/$(database)/documents/students/$(userData().studentId));
+    }
+
+    function studentOwnsClass(classId) {
+      return linkedStudentExists()
+        && get(/databases/$(database)/documents/students/$(userData().studentId)).data.classId == classId;
+    }
+
+    function assignedSubject(classId, subjectId) {
+      let subjectPath = /databases/$(database)/documents/subjects/$(subjectId);
+      return assignedClass(classId)
+        && subjectId in teacherData().get('assignedSubjects', [])
+        && exists(subjectPath)
+        && get(subjectPath).data.classId == classId
+        && get(subjectPath).data.teacherId == userData().teacherId;
+    }
+
+    function teacherCanReadSession(session) {
+      return assignedClass(session.classId);
+    }
+
+    function teacherCanWriteSession(session) {
+      return isTeacher()
+        && session.teacherId == userData().teacherId
+        && assignedSubject(session.classId, session.subjectId);
+    }
+
+    function teacherCanReadRecord(record) {
+      return isTeacher()
+        && record.teacherId == userData().teacherId
+        && assignedClass(record.classId);
+    }
+
+    function recordStudentIsInClass(record) {
+      let studentPath = /databases/$(database)/documents/students/$(record.studentId);
+      return exists(studentPath)
+        && get(studentPath).data.classId == record.classId;
+    }
+
+    function recordMatchesSession(record) {
+      let sessionPath = /databases/$(database)/documents/attendanceSessions/$(record.sessionId);
+      return existsAfter(sessionPath)
+        && getAfter(sessionPath).data.classId == record.classId
+        && getAfter(sessionPath).data.subjectId == record.subjectId
+        && getAfter(sessionPath).data.date == record.date
+        && getAfter(sessionPath).data.teacherId == record.teacherId;
+    }
+
+    match /users/{userId} {
+      allow get: if signedIn() && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasAll([
+          'uid', 'email', 'displayName', 'role', 'phone', 'department', 'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'role', 'phone', 'department', 'createdAt'
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == 'student';
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'phone'
+        ]);
+      allow delete: if false;
+    }
+
+    match /students/{studentId} {
+      allow get: if isAdmin()
+        || (linkedStudentExists() && userData().studentId == studentId)
+        || assignedClass(resource.data.classId);
+      allow list: if isAdmin() || assignedClass(resource.data.classId);
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /teachers/{teacherId} {
+      allow get: if isAdmin()
+        || (isTeacher() && userData().teacherId == teacherId);
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /classes/{classId} {
+      allow get: if isAdmin()
+        || assignedClass(classId)
+        || studentOwnsClass(classId);
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /subjects/{subjectId} {
+      allow get: if isAdmin()
+        || (isTeacher()
+          && assignedClass(resource.data.classId)
+          && subjectId in teacherData().get('assignedSubjects', [])
+          && resource.data.teacherId == userData().teacherId)
+        || (isStudent() && studentOwnsClass(resource.data.classId));
+      allow list: if isAdmin()
+        || (isStudent() && studentOwnsClass(resource.data.classId));
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /attendanceSessions/{sessionId} {
+      allow get, list: if isAdmin()
+        || teacherCanReadSession(resource.data);
+      allow create: if isAdmin() || teacherCanWriteSession(request.resource.data);
+      allow update: if isAdmin() || (
+        teacherCanWriteSession(resource.data)
+        && teacherCanWriteSession(request.resource.data)
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /attendanceRecords/{recordId} {
+      allow get, list: if isAdmin()
+        || teacherCanReadRecord(resource.data)
+        || (isStudent()
+          && userData().get('studentId', '') != ''
+          && resource.data.studentId == userData().studentId);
+      allow create: if isAdmin() || (
+        teacherCanReadRecord(request.resource.data)
+        && assignedSubject(request.resource.data.classId, request.resource.data.subjectId)
+        && recordStudentIsInClass(request.resource.data)
+        && recordMatchesSession(request.resource.data)
+        && request.resource.data.status in ['Present', 'Absent', 'Late']
+      );
+      allow update: if isAdmin() || (
+        teacherCanReadRecord(resource.data)
+        && teacherCanReadRecord(request.resource.data)
+        && request.resource.data.sessionId == resource.data.sessionId
+        && request.resource.data.studentId == resource.data.studentId
+        && assignedSubject(request.resource.data.classId, request.resource.data.subjectId)
+        && recordStudentIsInClass(request.resource.data)
+        && recordMatchesSession(request.resource.data)
+        && request.resource.data.status in ['Present', 'Absent', 'Late']
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}
